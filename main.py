@@ -3,9 +3,6 @@ import pickle
 import json
 import lancedb
 import asyncio
-import hashlib
-import aiohttp
-import shutil
 from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
@@ -16,118 +13,164 @@ from dotenv import load_dotenv
 from sentence_transformers import SentenceTransformer, CrossEncoder
 from rank_bm25 import BM25Okapi
 from crawl4ai import AsyncWebCrawler, CrawlerRunConfig, LLMExtractionStrategy, LLMConfig
-from unstructured.partition.pdf import partition_pdf
-from unstructured.chunking.title import chunk_by_title
-from unstructured.documents.elements import Text, CompositeElement
-import camelot
 
 # --- Configuration & Models ---
 load_dotenv()
+# The API token required by the hackathon judging platform
 API_TOKEN = "3e0af1293189f8f9129d33fb7d568a40c997067afa84f791cbd17e9404b5a35c"
 TOGETHER_API_KEY = os.getenv("TOGETHER_API_KEY")
-CACHE_DIR = "./cache"
-os.makedirs(CACHE_DIR, exist_ok=True)
+
+if not TOGETHER_API_KEY:
+    raise ValueError("TOGETHER_API_KEY not found in .env file. Please create it.")
 
 # --- Pydantic Models ---
 class QueryRequest(BaseModel):
     documents: str
     questions: List[str]
-# ... (Other Pydantic models: QueryResponse, ClauseSelectionResponse, AdjudicationResponse remain the same as before)
 
-# --- Ingestion & Core Building Logic (Adapted from Colab) ---
-def run_ingestion_for_file(pdf_path: str) -> List[CompositeElement]:
-    print(f"  - Running ingestion for: {pdf_path}")
-    elements = partition_pdf(filename=pdf_path, strategy="hi_res", infer_table_structure=True)
-    try:
-        tables = camelot.read_pdf(pdf_path, pages='all', flavor='lattice')
-        if tables.n > 0:
-            for table in tables:
-                elements.append(Text(f"TABLE:\n\n{table.df.to_markdown()}\n"))
-    except Exception:
-        pass # Ignore camelot errors for non-standard PDFs
-    chunks = chunk_by_title(elements, max_characters=1024)
-    for chunk in chunks:
-        chunk.metadata.source = os.path.basename(pdf_path)
-    return chunks
+class QueryResponse(BaseModel):
+    answers: List[str]
 
-def build_cognitive_core(chunks: List[CompositeElement], output_dir: str):
-    print(f"  - Building Cognitive Core in: {output_dir}")
-    os.makedirs(output_dir, exist_ok=True)
-    corpus_texts = [chunk.text for chunk in chunks]
-    
-    # Vector Store
-    embedding_model = SentenceTransformer('all-Mini-LM-L6-v2')
-    vectors = embedding_model.encode(corpus_texts)
-    data_for_db = [{"vector": v, "text": t, "source": c.metadata.source} for v, t, c in zip(vectors, corpus_texts, chunks)]
-    db = lancedb.connect(os.path.join(output_dir, "db.lancedb"))
-    db.create_table("policies", data=data_for_db)
-    
-    # Sparse Index
-    tokenized_corpus = [doc.lower().split(" ") for doc in corpus_texts]
-    bm25 = BM25Okapi(tokenized_corpus)
-    with open(os.path.join(output_dir, "bm25.pkl"), "wb") as f:
-        pickle.dump(bm25, f)
-    print("  - ✅ Core built successfully.")
+class ClauseSelectionResponse(BaseModel):
+    relevant_clause_numbers: List[int]
 
-# --- The Adjudicator Engine (Unchanged) ---
+class AdjudicationResponse(BaseModel):
+    decision: str
+    amount: Optional[str] = "Not Applicable"
+    justification: str
+
+# --- The Adjudicator Engine ---
 class Adjudicator:
-    # ... (The entire Adjudicator class from our last version goes here, unchanged) ...
-    # It will be initialized dynamically with the correct paths.
+    def __init__(self, db_path, bm25_path):
+        print("🚀 Initializing Adjudicator Engine...")
+        # Load Cognitive Core from files
+        db = lancedb.connect(db_path)
+        self.table = db.open_table("policies")
+        with open(bm25_path, "rb") as f:
+            self.bm25 = pickle.load(f)
+        self.corpus_texts = self.table.to_pandas()['text'].tolist()
+        
+        # Initialize ML models
+        self.dense_model = SentenceTransformer('all-MiniLM-L6-v2')
+        self.cross_encoder = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+        
+        # Main model for reasoning
+        self.llm_config = LLMConfig(provider="together_ai/mistralai/Mixtral-8x7B-Instruct-v0.1", api_token=TOGETHER_API_KEY)
+        # Specialized model for instruction-following (JSON selection)
+        self.selection_llm_config = LLMConfig(provider="together_ai/meta-llama/Llama-3-8b-chat-hf", api_token=TOGETHER_API_KEY)
+        print("✅ Engine Ready!")
 
-# --- FastAPI Application & Caching Logic ---
+    def _retrieve_and_rerank(self, query: str, top_k: int) -> List[str]:
+        query_vector = self.dense_model.encode(query)
+        vector_results = self.table.search(query_vector).limit(20).to_pandas()
+        tokenized_query = query.lower().split(" ")
+        bm25_scores = self.bm25.get_scores(tokenized_query)
+        top_bm25_indices = sorted(range(len(bm25_scores)), key=lambda i: bm25_scores[i], reverse=True)[:20]
+        combined_indices = set(vector_results.index) | set(top_bm25_indices)
+        sentence_pairs = [[query, self.corpus_texts[i]] for i in combined_indices]
+        scores = self.cross_encoder.predict(sentence_pairs)
+        reranked_results = sorted(zip(scores, combined_indices), key=lambda x: x[0], reverse=True)
+        return [self.corpus_texts[idx] for score, idx in reranked_results[:top_k]]
+
+    async def adjudicate_single_question(self, query: str) -> Optional[Dict]:
+        print(f"\n🚀 Running Full Adjudication for: '{query}'")
+        
+        # Part 1: Attack & Defend Retrieval
+        defend_clauses = self._retrieve_and_rerank(query, top_k=10)
+        attack_query = f"reasons to reject or exclude a claim for {query} including waiting periods and specific exclusions"
+        attack_clauses = self._retrieve_and_rerank(attack_query, top_k=5)
+        
+        combined_clauses = []
+        seen_texts = set()
+        for clause in defend_clauses + attack_clauses:
+            if clause not in seen_texts:
+                combined_clauses.append(clause)
+                seen_texts.add(clause)
+        
+        candidate_clauses = combined_clauses
+        if not candidate_clauses: return None
+
+        # Part 2: Two-Stage Logic (Selector)
+        print(f"  - [Stage 1] Selecting from {len(candidate_clauses)} candidates...")
+        numbered_candidates = "\n\n".join([f"--- Clause {i+1} ---\n{chunk}" for i, chunk in enumerate(candidate_clauses)])
+        selection_prompt = f"""From the numbered policy clauses below, identify ALL clauses that are directly relevant to making a decision on the user's claim. Respond ONLY with a JSON object containing a list of the relevant integer numbers.
+**User's Claim:** "{query}"
+**Numbered Policy Clauses:**\n{numbered_candidates}"""
+
+        selection_strategy = LLMExtractionStrategy(llm_config=self.selection_llm_config, schema=ClauseSelectionResponse.model_json_schema(), instruction=selection_prompt, extraction_type="schema")
+        
+        final_clauses = candidate_clauses # Default
+        try:
+            async with AsyncWebCrawler() as crawler:
+                selection_result = await crawler.arun(url="raw://placeholder", config=CrawlerRunConfig(extraction_strategy=selection_strategy))
+            if selection_result.success and selection_result.extracted_content:
+                raw_output = json.loads(selection_result.extracted_content)
+                selection_json = raw_output[0] if isinstance(raw_output, list) and raw_output else raw_output
+                if selection_json and isinstance(selection_json, dict):
+                    selected_indices = [i - 1 for i in selection_json.get("relevant_clause_numbers", [])]
+                    if selected_indices:
+                        final_clauses = [candidate_clauses[i] for i in selected_indices if 0 <= i < len(candidate_clauses)]
+        except Exception:
+            pass
+        print(f"  - [Stage 1] ✅ Refined to {len(final_clauses)} essential clauses.")
+
+        # Part 3: Advanced Prompting (Verdict)
+        print("  - [Stage 2] Making final decision...")
+        final_context = "\n\n---\n\n".join(final_clauses)
+        verdict_prompt = f"""You are an expert insurance claim adjudicator. Your task is to analyze the user's claim against a small, highly relevant set of policy clauses and produce a final, structured decision in JSON format.
+First, think step-by-step to outline your reasoning based on the provided clauses. Check for waiting periods, exclusions, and coverage limits.
+Second, based on your reasoning, produce the final JSON object.
+
+**--- EXAMPLE ---**
+**Claim:** "I have a 3-month-old policy and need cataract surgery."
+**Clauses:** "Clause 4.b: A waiting period of 24 months applies to cataract surgery."
+**Reasoning:**
+1. The user's policy is 3 months old.
+2. Clause 4.b states a 24-month waiting period for cataract surgery.
+3. The user is within the waiting period.
+4. Therefore, the claim must be rejected.
+**Final JSON:**
+{{
+  "decision": "Rejected",
+  "amount": "Not Applicable",
+  "justification": "The claim for cataract surgery is rejected as the 3-month-old policy is within the 24-month waiting period specified in Clause 4.b."
+}}
+**--- END EXAMPLE ---**
+
+**--- CURRENT CASE ---**
+**Claim:** "{query}"
+**Clauses:**\n{final_context}
+
+**Reasoning:**
+1. [Your reasoning steps here]
+
+**Final JSON:**
+"""
+
+        verdict_strategy = LLMExtractionStrategy(llm_config=self.llm_config, schema=AdjudicationResponse.model_json_schema(), instruction=verdict_prompt, extraction_type="schema")
+        
+        try:
+            async with AsyncWebCrawler() as crawler:
+                result = await crawler.arun(url="raw://placeholder", config=CrawlerRunConfig(extraction_strategy=verdict_strategy))
+            if not result.success or not result.extracted_content: return None
+            raw_output = json.loads(result.extracted_content)
+            response_dict = raw_output[0] if isinstance(raw_output, list) and raw_output else raw_output
+            return response_dict if isinstance(response_dict, dict) else None
+        except Exception:
+            return None
+
+# --- FastAPI Application ---
 app = FastAPI(title="HackRx Dynamic Adjudication Engine")
 bearer_scheme = HTTPBearer()
 
-# In-memory cache to map document URLs to their Adjudicator instances
-ADJUDICATOR_CACHE = {}
+adjudicator = Adjudicator(db_path="./policies.lancedb", bm25_path="./bm25_index.pkl")
 
 def verify_token(credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme)):
     if credentials.scheme != "Bearer" or credentials.credentials != API_TOKEN:
         raise HTTPException(status_code=401, detail="Invalid or missing API token")
 
-async def get_or_create_adjudicator(doc_url: str) -> Adjudicator:
-    if doc_url in ADJUDICATOR_CACHE:
-        print(f"✅ Found cached adjudicator for: {doc_url}")
-        return ADJUDICATOR_CACHE[doc_url]
-
-    print(f"🔥 No cache found. Building new adjudicator for: {doc_url}")
-    
-    # Create a unique, safe directory name from the URL hash
-    url_hash = hashlib.md5(doc_url.encode()).hexdigest()
-    core_path = os.path.join(CACHE_DIR, url_hash)
-    
-    # Download the file
-    temp_file_path = os.path.join(CACHE_DIR, f"{url_hash}.pdf")
-    async with aiohttp.ClientSession() as session:
-        async with session.get(doc_url) as resp:
-            if resp.status != 200:
-                raise HTTPException(status_code=400, detail="Could not download document from URL.")
-            with open(temp_file_path, 'wb') as f:
-                f.write(await resp.read())
-    
-    # Run the full pipeline
-    chunks = run_ingestion_for_file(temp_file_path)
-    build_cognitive_core(chunks, core_path)
-    
-    # Initialize and cache the new Adjudicator
-    adjudicator = Adjudicator(
-        db_path=os.path.join(core_path, "db.lancedb"),
-        bm25_path=os.path.join(core_path, "bm25.pkl")
-    )
-    ADJUDICATOR_CACHE[doc_url] = adjudicator
-    
-    # Clean up the downloaded PDF
-    os.remove(temp_file_path)
-    
-    return adjudicator
-
 @app.post("/hackrx/run", response_model=QueryResponse, dependencies=[Depends(verify_token)])
 async def process_queries(request: QueryRequest):
-    try:
-        adjudicator = await get_or_create_adjudicator(request.documents)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to process document: {str(e)}")
-        
     tasks = [adjudicator.adjudicate_single_question(q) for q in request.questions]
     results = await asyncio.gather(*tasks)
     
