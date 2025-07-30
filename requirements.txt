@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+lancedb
+sentence-transformers
+rank_bm25
+crawl4ai>=0.6.0
+together
+pydantic
+unstructured
