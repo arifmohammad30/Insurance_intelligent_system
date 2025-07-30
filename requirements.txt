@@ -9,4 +9,4 @@ together
 pydantic
 unstructured
 pandas
-playwright install
+playwright 
