@@ -1,12 +1,13 @@
 fastapi
 uvicorn[standard]
 python-dotenv
-lancedb
+requests
+unstructured[pdf,docx]
+pymupdf
+# camelot-py[cv] is not needed for the API, only for the Colab build
 sentence-transformers
 rank_bm25
+lancedb
+spacy
 crawl4ai>=0.6.0
-together
-pydantic
-unstructured
-pandas
-playwright 
+openai
