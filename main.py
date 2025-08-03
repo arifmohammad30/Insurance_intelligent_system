@@ -195,6 +195,11 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+@app.get("/", include_in_schema=False)
+async def health_check():
+    return {"status": "ok"}
+
+
 @app.post("/hackrx/run", response_model=APIResponse, tags=["Adjudication"])
 async def run_adjudication(request: APIRequest, token: str = Depends(verify_token)):
     if not adjudicator_engine:
