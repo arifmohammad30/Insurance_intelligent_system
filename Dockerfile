@@ -9,7 +9,7 @@ RUN apt-get update && apt-get install -y \
     libgl1-mesa-glx \
     && rm -rf /var/lib/apt/lists/*
 
-# Add the local bin directory to the PATH
+# Add the local bin directory (where pip installs executables) to the PATH
 ENV PATH="/root/.local/bin:${PATH}"
 
 # Copy and install Python requirements
