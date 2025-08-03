@@ -5,16 +5,18 @@ FROM python:3.12-slim
 WORKDIR /app
 
 # Install all system dependencies required by our libraries
-# This prevents the environment errors we saw before
 RUN apt-get update && apt-get install -y \
     libgl1-mesa-glx \
     && rm -rf /var/lib/apt/lists/*
+
+# Add the local bin directory to the PATH
+ENV PATH="/root/.local/bin:${PATH}"
 
 # Copy and install Python requirements
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install the Playwright browser binaries
+# Install the Playwright browser binaries (this will now work)
 RUN playwright install
 
 # Copy the rest of your application code into the container
